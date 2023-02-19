@@ -8,7 +8,7 @@ var debug = require('debug')('backend-dl:server');
 var app = express();
 var cors = require('cors')
 var os = require('os')
-
+const { v4: uuidv4 } = require('uuid');
 const ytdl = require('ytdl-core');
 const fs = require('fs');
 const ProgressBar = require('progress');
@@ -42,17 +42,31 @@ const io = require("socket.io")(server, {
 })
 
 
+var videos_queue = []
+
 
 
 const socket = io.sockets.on('connection', (socket) => {
   console.log('WebSocket connection established');
 
   console.log("a user connected", socket.id);
+
   socket.on("disconnect", () => {
     console.log("user disconnected", socket.id);
   });
 
+  socket.on("cancel",
 
+    (data) => {
+      console.log(data);
+      videos_queue.forEach((video) => {
+        if (video.uuid === data.uuid) {
+          video.abortion = true;
+        }
+      })
+    }
+
+  )
 
 })
 
@@ -97,6 +111,8 @@ const dl_handler = async (req, res, next) => {
     format
   });
 
+
+
   try {
 
 
@@ -104,8 +120,20 @@ const dl_handler = async (req, res, next) => {
     video.once('response', (response) => {
       totalSize = parseInt(response.headers['content-length'], 10);
       start = Date.now();
+      const uuid = uuidv4();
+      videos_queue.push(
+        {
+          uuid: uuid,
+          abortion: false
+        }
+      )
 
 
+      socket.emit('downloadStart',
+        {
+          uuid
+        }
+      );
 
 
       const progressBar = new ProgressBar('-> downloading [:bar] :percent :etas', {
@@ -124,19 +152,43 @@ const dl_handler = async (req, res, next) => {
         const elapsed = now - start;
         speed = bytesReceived / elapsed;
 
-        socket.emit('downloadProgress',
-          {
-            progress: progressBar.curr,
-            total: progressBar.total,
-            downloadSpeed:
-            {
-              percentage: Math.ceil((progressBar.curr / progressBar.total) * 100),
-              speed: parseFloat(speed).toFixed(2),
-              timeLeft: parseFloat((totalSize - bytesReceived) / (speed*1_000)).toFixed(2)
+        if (videos_queue.find(video => video.uuid === uuid).abortion) {
+          console.log('Aborting download');
+          socket.emit('downloadAborted', 'Download aborted');
+          video.destroy();
+          output.destroy();
+          // remove file
+          fs.unlinkSync(
+            videoPath,
+            (err) => {
+              if (err) {
+                console.log(err);
+              }
             }
-          }
-        );
-        progressBar.tick(chunk.length);
+          )
+          videos_queue = videos_queue.filter(video => video.uuid !== uuid);
+          res.send({
+            message: 'aborted'
+          })
+        }
+
+        else {
+          socket.emit('downloadProgress',
+            {
+              progress: progressBar.curr,
+              total: progressBar.total,
+              downloadSpeed:
+              {
+                percentage: Math.ceil((progressBar.curr / progressBar.total) * 100),
+                speed: parseFloat(speed).toFixed(2),
+                timeLeft: parseFloat((totalSize - bytesReceived) / (speed * 1_000)).toFixed(2)
+              }
+            }
+          );
+          progressBar.tick(chunk.length);
+        }
+
+
 
       })
 
@@ -145,15 +197,19 @@ const dl_handler = async (req, res, next) => {
       )
 
 
-
       video.on('end', () => {
 
         console.log('Download complete');
-        socket.emit('end', 'Download complete');
+        socket.emit('end',
+          {
+            message: 'Download complete',
+            path: `${videoPath.replace(/\\/g, '/')}`,
+            name: videoName
+          }
+        );
         res.json(
           {
-            path: `file:///${videoPath.replace(/\\/g, '/')}` ,
-            name: videoName
+            message: "done"
           }
         )
         // socket.disconnect();
@@ -164,6 +220,8 @@ const dl_handler = async (req, res, next) => {
         socket.emit('downloadError', 'Error downloading video');
         // socket.disconnect();
       });
+
+
 
     });
 
@@ -212,6 +270,8 @@ app.use(function (err, req, res, next) {
   res.status(err.status || 500);
   res.render('error');
 });
+
+
 
 
 
